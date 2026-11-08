@@ -1,0 +1,126 @@
+"""
+Run:  python test_validator.py
+Checks the complaint validator on sentences that are NOT in any training file.
+"""
+import os, re, sys
+import pandas as pd
+from validator import ComplaintValidator
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+VALID_TEST = [
+"Streetlight not working near my building",
+"Power cut again",
+"no water since morning",
+"Garbage not collected",
+"pothole near the school gate",
+"drain overflowing",
+"I am a resident of Andheri and the road outside my society is full of potholes.",
+"I am a student and the streetlights near my college hostel have not worked for a week.",
+"Hello, there is no water supply in our lane since two days, please help.",
+"Sir, the garbage van has not come for the last five days and the dustbin is overflowing.",
+"The sewage line near Sai Nagar is overflowing and the smell is unbearable.",
+"Road near the railway station is badly damaged, please repair.",
+"Electric wire is hanging low near the bus stop, very dangerous.",
+"The nullah is blocked and rainwater has entered the ground floor houses.",
+"Water is leaking from a broken pipe on the main road.",
+"Please clean the public toilet in our area, it is very dirty.",
+"Stray dogs are tearing garbage bags and spreading waste on our street.",
+"The manhole near the market is open and dirty water is coming out.",
+"The transformer in our colony exploded and there is no electricity.",
+"Tap water is coming black and smelly.",
+"Garbage dump near the school gate is not cleared for ten days.",
+"Streetlights on the highway flyover are not glowing at night.",
+"The pothole near the petrol pump is very deep and dangerous for bikes.",
+"Rain water is collecting on the road because the gutter is jammed.",
+"No lights in our lane, it is very unsafe for women at night.",
+"Pipeline burst near the temple and water is flowing on the road.",
+"Sweeper does not come to clean our street.",
+"Voltage is very low in the evening.",
+"There is a big crack on the road near the bridge.",
+"Sewage water entering our house during rain.",
+"Low water pressure in the building",
+"The dustbin near the gate is broken and waste is all over.",
+"Power failure in our area since last night, nobody is responding.",
+"Open drain near the school is dangerous for kids.",
+"Roads are damaged near the market, repair needed.",
+"pls clean the garbage in front of my shop",
+"Water supply was cut without notice.",
+"There is a heap of waste on the footpath near the bus stand.",
+"A tree fell on the electric wire and the line is down.",
+"Road is completely washed out near the culvert after the flood.",
+"Our street light bulbs are fused.",
+"Water tanker has not arrived for the past three days.",
+"The roadside drain is overflowing onto the road and stinking.",
+"Potholes near the signal are causing a traffic jam every evening.",
+"A speeding truck hit an electric pole and caused an accident.",
+"A moving truck hit the streetlight pole near the school.",
+"Water is running from the tap all day and being wasted.",
+"The electric pole fell on a car and caused an accident.",
+]
+
+INVALID_TEST = [
+"I am a stray cow in my locality.",
+"I am a monkey near the road.",
+"I am an electric pole in front of your house.",
+"I am a goat.",
+"My pet parrot escaped from the cage.",
+"Hello sir, how are you doing today?",
+"Whats up buddy",
+"My phone battery drains too fast.",
+"My Wi-Fi connection keeps disconnecting.",
+"I did not get my pension this month.",
+"Please tell me my exam timetable.",
+"Where can I buy a good laptop?",
+"The cricket match was thrilling yesterday.",
+"xyz abc pqr lmn",
+"qwertyuiop asdfghjkl",
+"jjjjjjjjjjjjjj",
+"hhhhh hhhhh hhhhh",
+"1234567890 1234567890",
+"!!!! ???? ####",
+"I love my country India.",
+"Dragons are flying over the garbage.",
+"The garbage is dancing in my dreams.",
+"The streetlight is my girlfriend.",
+"I want to adopt a puppy from the road.",
+"Everything is fine in our area, no problems at all.",
+"Great work by the municipal staff, thank you.",
+"I need money urgently, please send.",
+"Free recharge click on the link.",
+"My friend is angry with me.",
+"Why is the sky blue?",
+"Tell me something interesting.",
+"Not sure what to write here.",
+"Just checking this app.",
+"I will complain later.",
+"Nothing.",
+"Stray dogs are beautiful creatures.",
+"I am a pothole on your road, fix me.",
+"A fish is swimming in my coffee.",
+"The elephant sat on the electric pole and sang.",
+"You are a stupid idiot.",
+"A moving electric pole caused a fatal car accident",
+"The streetlight is walking in our lane.",
+"A dancing transformer is scaring the children.",
+"The road keeps jumping every night.",
+]
+
+def main():
+    data = pd.read_csv(os.path.join(BASE, "complaints_dataset.csv"))
+    v = ComplaintValidator(data["complaint"], os.path.join(BASE, "invalid_examples.csv"))
+    fr = [t for t in VALID_TEST if not v.validate(t)[0]]
+    fa = [t for t in INVALID_TEST if v.validate(t)[0]]
+    print(f"Genuine complaints wrongly rejected: {len(fr)}/{len(VALID_TEST)}")
+    for t in fr: print("   REJECTED:", t, "->", v.validate(t)[1][:70], f"(p={v.p_valid(t):.2f})")
+    print(f"Invalid entries wrongly accepted:    {len(fa)}/{len(INVALID_TEST)}")
+    for t in fa: print("   ACCEPTED:", t, f"(p={v.p_valid(t):.2f})")
+    ok = len(VALID_TEST) - len(fr) + len(INVALID_TEST) - len(fa)
+    print(f"Overall: {ok}/{len(VALID_TEST)+len(INVALID_TEST)} correct")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
