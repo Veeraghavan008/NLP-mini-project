@@ -1,0 +1,191 @@
+CivicCare - shared logic (no GUI).
+
+File locations, department list, text cleaning, model training, priority
+rules, CSV helpers and password hashing. Used by app.py (citizen portal) and
+admin_panel.py (administrator interface).
+"""
+
+import csv
+import hashlib
+import os
+import re
+import secrets
+
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_FILE = os.path.join(BASE_DIR, "complaints_dataset.csv")
+USERS_FILE = os.path.join(BASE_DIR, "users.csv")
+ADMINS_FILE = os.path.join(BASE_DIR, "admins.csv")
+COMPLAINTS_FILE = os.path.join(BASE_DIR, "submitted_complaints.csv")
+INVALID_FILE = os.path.join(BASE_DIR, "invalid_examples.csv")
+
+# If the category model is less sure than this, do not guess a department.
+MIN_CATEGORY_CONFIDENCE = 0.35
+
+DEPARTMENTS = {
+    "Roads & Potholes": "Road Maintenance Department",
+    "Water Supply": "Water Department",
+    "Garbage & Sanitation": "Sanitation Department",
+    "Electricity & Streetlights": "Electrical Department",
+    "Drainage & Sewage": "Drainage Department",
+    "Fire & Emergency": "Fire Brigade & Emergency Services",
+    "Crime & Public Safety": "Police Department",
+    "Other Civic Issues": "General Administration",
+}
+
+STATUSES = ["Pending", "In Progress", "Resolved", "Rejected"]
+PRIORITIES = ["High", "Medium", "Low"]
+
+USER_FIELDS = ["username", "salt", "password_hash", "created_at"]
+ADMIN_FIELDS = ["username", "salt", "password_hash", "created_at"]
+COMPLAINT_FIELDS = [
+    "Complaint ID", "Username", "Date", "Complaint", "Category",
+    "Department", "Priority", "Status", "Admin Remark", "Updated At"
+]
+
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"[^a-z\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def train_model():
+    if not os.path.exists(DATASET_FILE):
+        raise FileNotFoundError(
+            "complaints_dataset.csv is missing. Keep it in the same folder as app.py."
+        )
+    data = pd.read_csv(DATASET_FILE).dropna(subset=["complaint", "category"])
+    data["clean_complaint"] = data["complaint"].apply(clean_text)
+
+    model = Pipeline([
+        ("features", FeatureUnion([
+            ("words", TfidfVectorizer(
+                ngram_range=(1, 2), stop_words="english")),
+            ("chars", TfidfVectorizer(
+                analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True)),
+        ])),
+        ("classifier", LogisticRegression(
+            max_iter=3000, C=10, random_state=42))
+    ])
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        data["clean_complaint"], data["category"],
+        test_size=0.25, random_state=42, stratify=data["category"]
+    )
+    model.fit(x_train, y_train)
+    accuracy = accuracy_score(y_test, model.predict(x_test))
+    model.fit(data["clean_complaint"], data["category"])
+    return model, accuracy, len(data)
+
+def detect_priority(text, category=None):
+    """Rule-based priority from danger words, with a floor for some categories."""
+    text = text.lower()
+    high_words = [
+        "accident", "danger", "emergency", "overflow", "flood",
+        "injury", "injured", "exposed wire", "sewage", "fire", "electric shock",
+        "explosion", "blast", "trapped", "gas leak", "weapon", "knife", "gun",
+        "attack", "kidnap", "missing child", "murder", "bomb", "assault",
+        "robbery", "threat", "stalking", "harass"
+    ]
+    medium_words = [
+        "not working", "stopped", "leak", "blocked", "pothole",
+        "broken", "bad smell", "no water", "damaged", "suspicious",
+        "theft", "stolen", "illegal"
+    ]
+    if any(word in text for word in high_words):
+        priority = "High"
+    elif any(word in text for word in medium_words):
+        priority = "Medium"
+    else:
+        priority = "Low"
+
+    if category == "Fire & Emergency":
+        return "High"
+    if category == "Crime & Public Safety" and priority == "Low":
+        return "Medium"
+    return priority
+
+def ensure_file(path, fields):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
+
+def read_rows(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+def save_rows(path, fields, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+def hash_password(password, salt=None):
+    """Store a salted PBKDF2 hash, never the plain-text password."""
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000
+    ).hex()
+    return salt, digest
+
+
+def verify_password(password, salt, expected_hash):
+    _, digest = hash_password(password, salt)
+    return secrets.compare_digest(digest, expected_hash)
+
+
+def migrate_complaints_file():
+    """Upgrade an older complaints file (without admin columns) in place."""
+    if not os.path.exists(COMPLAINTS_FILE):
+        ensure_file(COMPLAINTS_FILE, COMPLAINT_FIELDS)
+        return
+    with open(COMPLAINTS_FILE, "r", newline="", encoding="utf-8") as f:
+        header = next(csv.reader(f), [])
+    if header != COMPLAINT_FIELDS:
+        save_rows(COMPLAINTS_FILE, COMPLAINT_FIELDS, read_rows(COMPLAINTS_FILE))
+
+
+def _append_row(path, row):
+    """Append one CSV row, adding a newline first if the file lacks one."""
+    needs_newline = False
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            needs_newline = f.read(1) not in (b"\n", b"\r")
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        if needs_newline:
+            f.write("\n")
+        csv.writer(f).writerow(row)
+
+
+def add_training_example(complaint, category):
+    """Append an admin-corrected complaint to the training dataset.
+    Returns True if added, False if that exact text is already there."""
+    data = pd.read_csv(DATASET_FILE)
+    key = clean_text(complaint)
+    if any(clean_text(t) == key for t in data["complaint"].dropna()):
+        return False
+    _append_row(DATASET_FILE, [complaint.strip(), category])
+    return True
+
+
+def add_invalid_example(text):
+    """Append a complaint the admin judged invalid to invalid_examples.csv."""
+    existing = []
+    if os.path.exists(INVALID_FILE):
+        existing = pd.read_csv(INVALID_FILE)["text"].dropna().astype(str).tolist()
+    key = clean_text(text)
+    if any(clean_text(t) == key for t in existing):
+        return False
+    if not os.path.exists(INVALID_FILE):
+        with open(INVALID_FILE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["text"])
+    _append_row(INVALID_FILE, [text.strip()])
+    return True
