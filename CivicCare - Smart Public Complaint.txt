@@ -1,0 +1,622 @@
+CivicCare - Smart Public Complaint Management System
+Tkinter app with citizen registration/login, per-user complaint history,
+TF-IDF + Logistic Regression category prediction, complaint input
+validation (see validator.py), 8 departments, CSV storage, and an
+administrator console (see admin_panel.py).
+
+Run:
+    python -m pip install pandas scikit-learn
+    python app.py
+"""
+
+import csv
+import re
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+
+import pandas as pd
+
+from admin_panel import AdminPanel
+from core import (  # noqa: F401  (re-exported so tests can use app.<name>)
+    ADMIN_FIELDS, ADMINS_FILE, BASE_DIR, COMPLAINT_FIELDS, COMPLAINTS_FILE,
+    DATASET_FILE, DEPARTMENTS, INVALID_FILE, MIN_CATEGORY_CONFIDENCE,
+    USER_FIELDS, USERS_FILE, clean_text, detect_priority, ensure_file,
+    hash_password, migrate_complaints_file, read_rows, save_rows, train_model,
+    verify_password,
+)
+from validator import ComplaintValidator
+
+CITIZEN_SIZE = "900x650"
+ADMIN_SIZE = "1150x780"
+MAX_ADMIN_FAILURES = 5
+ADMIN_LOCK_SECONDS = 60
+
+class CivicCareApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("CivicCare | Citizen Portal")
+        self.root.geometry(CITIZEN_SIZE)
+        self.root.minsize(760, 560)
+        self.root.configure(bg="#eef3f8")
+
+        ensure_file(USERS_FILE, USER_FIELDS)
+        ensure_file(ADMINS_FILE, ADMIN_FIELDS)
+        migrate_complaints_file()
+
+        try:
+            self.retrain_model()
+        except Exception as exc:
+            messagebox.showerror("Model error", str(exc))
+            self.root.destroy()
+            return
+
+        self.current_user = None
+        self.admin_mode = False
+        self.admin_failures = 0
+        self.admin_locked_until = 0.0
+        self.show_auth_screen()
+
+    def retrain_model(self):
+        """(Re)train the category model and the complaint validator."""
+        self.model, self.accuracy, self.dataset_size = train_model()
+        known = pd.read_csv(DATASET_FILE)["complaint"].dropna()
+        self.validator = ComplaintValidator(known, INVALID_FILE)
+
+    def clear_window(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def build_header(self, subtitle):
+        header = tk.Frame(self.root, bg="#15344d", padx=22, pady=16)
+        header.pack(fill="x")
+        tk.Label(
+            header, text="CivicCare", font=("Arial", 22, "bold"),
+            fg="white", bg="#15344d"
+        ).pack(anchor="w")
+        tk.Label(
+            header, text=subtitle, font=("Arial", 10),
+            fg="#d7e7f3", bg="#15344d"
+        ).pack(anchor="w", pady=(3, 0))
+
+    def show_auth_screen(self):
+        self.current_user = None
+        if self.admin_mode:
+            self.admin_mode = False
+            self.root.geometry(CITIZEN_SIZE)
+        self.clear_window()
+        self.build_header("Smart Public Complaint Management | Login")
+
+        body = tk.Frame(self.root, bg="#eef3f8", padx=25, pady=25)
+        body.pack(fill="both", expand=True)
+
+        card = tk.Frame(body, bg="white", padx=28, pady=24,
+                        highlightbackground="#d8e1ea", highlightthickness=1)
+        card.pack(pady=25)
+
+        tk.Label(
+            card, text="Welcome to CivicCare",
+            font=("Arial", 19, "bold"), bg="white", fg="#15344d"
+        ).pack(anchor="w")
+        tk.Label(
+            card, text="Login to submit complaints and track their progress.",
+            font=("Arial", 10), bg="white", fg="#64748b"
+        ).pack(anchor="w", pady=(5, 18))
+
+        self.auth_notebook = ttk.Notebook(card, width=390)
+        self.auth_notebook.pack()
+        self.login_tab = tk.Frame(self.auth_notebook, bg="white", padx=18, pady=18)
+        self.register_tab = tk.Frame(self.auth_notebook, bg="white", padx=18, pady=18)
+        self.admin_tab = tk.Frame(self.auth_notebook, bg="white", padx=18, pady=18)
+        self.auth_notebook.add(self.login_tab, text="User Login")
+        self.auth_notebook.add(self.register_tab, text="Create Account")
+        self.auth_notebook.add(self.admin_tab, text="Admin Login")
+
+        self.build_login_tab()
+        self.build_register_tab()
+        self.build_admin_tab()
+
+        tk.Label(
+            body,
+            text="Demo project: create your own account using the Create Account tab.",
+            font=("Arial", 9), bg="#eef3f8", fg="#64748b"
+        ).pack()
+
+    def build_login_tab(self):
+        tk.Label(self.login_tab, text="Username", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.login_username = ttk.Entry(self.login_tab, width=42)
+        self.login_username.pack(pady=(5, 13), ipady=5)
+
+        tk.Label(self.login_tab, text="Password", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.login_password = ttk.Entry(self.login_tab, width=42, show="*")
+        self.login_password.pack(pady=(5, 16), ipady=5)
+
+        tk.Button(
+            self.login_tab, text="Login", command=self.login,
+            bg="#1769aa", fg="white", activebackground="#125487",
+            font=("Arial", 11, "bold"), relief="flat", cursor="hand2",
+            padx=15, pady=9
+        ).pack(fill="x")
+
+    def build_register_tab(self):
+        tk.Label(self.register_tab, text="Choose a username", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.reg_username = ttk.Entry(self.register_tab, width=42)
+        self.reg_username.pack(pady=(5, 12), ipady=5)
+
+        tk.Label(self.register_tab, text="Create password (minimum 6 characters)",
+                 bg="white", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.reg_password = ttk.Entry(self.register_tab, width=42, show="*")
+        self.reg_password.pack(pady=(5, 12), ipady=5)
+
+        tk.Label(self.register_tab, text="Confirm password", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.reg_confirm = ttk.Entry(self.register_tab, width=42, show="*")
+        self.reg_confirm.pack(pady=(5, 16), ipady=5)
+
+        tk.Button(
+            self.register_tab, text="Create Account", command=self.register,
+            bg="#16804a", fg="white", activebackground="#11663b",
+            font=("Arial", 11, "bold"), relief="flat", cursor="hand2",
+            padx=15, pady=9
+        ).pack(fill="x")
+
+    # ---------------------------------------------------------------- admin auth
+    def build_admin_tab(self):
+        for widget in self.admin_tab.winfo_children():
+            widget.destroy()
+        if read_rows(ADMINS_FILE):
+            self.build_admin_login()
+        else:
+            self.build_admin_setup()
+
+    def build_admin_login(self):
+        tk.Label(self.admin_tab, text="Administrator username", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.admin_username = ttk.Entry(self.admin_tab, width=42)
+        self.admin_username.pack(pady=(5, 13), ipady=5)
+
+        tk.Label(self.admin_tab, text="Password", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.admin_password = ttk.Entry(self.admin_tab, width=42, show="*")
+        self.admin_password.pack(pady=(5, 16), ipady=5)
+        self.admin_password.bind("<Return>", lambda e: self.admin_login())
+
+        tk.Button(
+            self.admin_tab, text="Login as Administrator",
+            command=self.admin_login, bg="#15344d", fg="white",
+            activebackground="#0e2436", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2", padx=15, pady=9
+        ).pack(fill="x")
+
+    def build_admin_setup(self):
+        tk.Label(
+            self.admin_tab, text="First-time setup",
+            font=("Arial", 12, "bold"), bg="white", fg="#15344d"
+        ).pack(anchor="w")
+        tk.Label(
+            self.admin_tab,
+            text="No administrator exists yet. Create the administrator "
+                 "account now.",
+            font=("Arial", 9), bg="white", fg="#64748b", wraplength=380,
+            justify="left"
+        ).pack(anchor="w", pady=(2, 10))
+
+        tk.Label(self.admin_tab, text="Administrator username", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.setup_username = ttk.Entry(self.admin_tab, width=42)
+        self.setup_username.pack(pady=(4, 9), ipady=4)
+        self.setup_username.insert(0, "admin")
+
+        tk.Label(self.admin_tab, text="Password (minimum 8 characters)",
+                 bg="white", font=("Arial", 10, "bold")).pack(anchor="w")
+        self.setup_password = ttk.Entry(self.admin_tab, width=42, show="*")
+        self.setup_password.pack(pady=(4, 9), ipady=4)
+
+        tk.Label(self.admin_tab, text="Confirm password", bg="white",
+                 font=("Arial", 10, "bold")).pack(anchor="w")
+        self.setup_confirm = ttk.Entry(self.admin_tab, width=42, show="*")
+        self.setup_confirm.pack(pady=(4, 12), ipady=4)
+
+        tk.Button(
+            self.admin_tab, text="Create Administrator Account",
+            command=self.create_admin, bg="#16804a", fg="white",
+            activebackground="#11663b", font=("Arial", 11, "bold"),
+            relief="flat", cursor="hand2", padx=15, pady=9
+        ).pack(fill="x")
+
+    def create_admin(self):
+        username = self.setup_username.get().strip()
+        password = self.setup_password.get()
+        if read_rows(ADMINS_FILE):
+            self.build_admin_tab()
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+            messagebox.showwarning(
+                "Invalid username",
+                "Use 3-20 letters, numbers or underscores for the username.")
+            return
+        if len(password) < 8:
+            messagebox.showwarning(
+                "Weak password", "The administrator password needs at "
+                                 "least 8 characters.")
+            return
+        if password != self.setup_confirm.get():
+            messagebox.showwarning("Password mismatch",
+                                   "The passwords do not match.")
+            return
+        salt, digest = hash_password(password)
+        save_rows(ADMINS_FILE, ADMIN_FIELDS, [{
+            "username": username, "salt": salt, "password_hash": digest,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }])
+        messagebox.showinfo("Administrator created",
+                            "Administrator account created. You can log in now.")
+        self.build_admin_tab()
+        self.admin_username.insert(0, username)
+
+    def admin_login(self):
+        remaining = self.admin_locked_until - time.time()
+        if remaining > 0:
+            messagebox.showwarning(
+                "Too many attempts",
+                f"Admin login is locked. Try again in {int(remaining) + 1} seconds.")
+            return
+        username = self.admin_username.get().strip()
+        password = self.admin_password.get()
+        if not username or not password:
+            messagebox.showwarning("Missing details",
+                                   "Enter both username and password.")
+            return
+
+        admin = next((a for a in read_rows(ADMINS_FILE)
+                      if a["username"].lower() == username.lower()), None)
+        # Same message for unknown user and wrong password.
+        if admin is None or not verify_password(
+                password, admin["salt"], admin["password_hash"]):
+            self.admin_failures += 1
+            if self.admin_failures >= MAX_ADMIN_FAILURES:
+                self.admin_failures = 0
+                self.admin_locked_until = time.time() + ADMIN_LOCK_SECONDS
+                messagebox.showerror(
+                    "Locked",
+                    f"Too many failed attempts. Admin login is locked for "
+                    f"{ADMIN_LOCK_SECONDS} seconds.")
+            else:
+                messagebox.showerror(
+                    "Login failed",
+                    "Incorrect administrator username or password.")
+            return
+
+        self.admin_failures = 0
+        self.show_admin_portal(admin["username"])
+
+    def show_admin_portal(self, username):
+        self.admin_mode = True
+        self.current_user = None
+        self.root.title("CivicCare | Administrator Console")
+        self.root.geometry(ADMIN_SIZE)
+        self.admin_panel = AdminPanel(self, username)
+
+    def register(self):
+        username = self.reg_username.get().strip()
+        password = self.reg_password.get()
+        confirm = self.reg_confirm.get()
+
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+            messagebox.showwarning(
+                "Invalid username",
+                "Use 3-20 letters, numbers or underscores for the username."
+            )
+            return
+        if len(password) < 6:
+            messagebox.showwarning(
+                "Weak password", "Password must contain at least 6 characters."
+            )
+            return
+        if password != confirm:
+            messagebox.showwarning(
+                "Password mismatch", "The passwords do not match."
+            )
+            return
+
+        users = read_rows(USERS_FILE)
+        if any(u["username"].lower() == username.lower() for u in users):
+            messagebox.showwarning(
+                "Username exists", "Please choose another username."
+            )
+            return
+
+        salt, digest = hash_password(password)
+        users.append({
+            "username": username,
+            "salt": salt,
+            "password_hash": digest,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+        save_rows(USERS_FILE, USER_FIELDS, users)
+        messagebox.showinfo(
+            "Account created", "Your account was created. You can now log in."
+        )
+        self.auth_notebook.select(self.login_tab)
+        self.login_username.delete(0, "end")
+        self.login_username.insert(0, username)
+        self.login_password.delete(0, "end")
+
+    def login(self):
+        username = self.login_username.get().strip()
+        password = self.login_password.get()
+        if not username or not password:
+            messagebox.showwarning(
+                "Missing details", "Enter both username and password."
+            )
+            return
+
+        users = read_rows(USERS_FILE)
+        user = next(
+            (u for u in users if u["username"].lower() == username.lower()),
+            None
+        )
+        if user is None:
+            messagebox.showerror(
+                "Login failed", "Account not found. Please create an account first."
+            )
+            return
+
+        if not verify_password(password, user["salt"], user["password_hash"]):
+            messagebox.showerror(
+                "Login failed", "Incorrect password. Please try again."
+            )
+            return
+
+        self.current_user = user["username"]
+        self.show_user_portal()
+
+    def show_user_portal(self):
+        self.root.title("CivicCare | Citizen Portal")
+        self.clear_window()
+        self.build_header(f"Citizen Portal | Logged in as {self.current_user}")
+
+        top = tk.Frame(self.root, bg="#eef3f8", padx=18, pady=10)
+        top.pack(fill="x")
+        tk.Label(
+            top, text=f"Hello, {self.current_user}!",
+            font=("Arial", 14, "bold"), bg="#eef3f8", fg="#15344d"
+        ).pack(side="left")
+        tk.Button(
+            top, text="Logout", command=self.show_auth_screen,
+            bg="#b42318", fg="white", relief="flat", padx=12, pady=5
+        ).pack(side="right")
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+
+        self.submit_tab = tk.Frame(self.notebook, bg="white", padx=22, pady=18)
+        self.history_tab = tk.Frame(self.notebook, bg="white", padx=18, pady=18)
+        self.notebook.add(self.submit_tab, text="Submit Complaint")
+        self.notebook.add(self.history_tab, text="My Complaints")
+
+        self.build_submit_tab()
+        self.build_history_tab()
+        self.refresh_history()
+
+    def build_submit_tab(self):
+        tk.Label(
+            self.submit_tab, text="Report a Public Issue",
+            font=("Arial", 18, "bold"), bg="white", fg="#15344d"
+        ).pack(anchor="w")
+        tk.Label(
+            self.submit_tab,
+            text="Describe the issue. The NLP model will predict its category.",
+            font=("Arial", 10), bg="white", fg="#536575"
+        ).pack(anchor="w", pady=(5, 13))
+
+        tk.Label(
+            self.submit_tab, text="Complaint description",
+            font=("Arial", 11, "bold"), bg="white"
+        ).pack(anchor="w")
+        self.complaint_text = tk.Text(
+            self.submit_tab, height=5, wrap="word", font=("Arial", 11),
+            relief="solid", bd=1, padx=9, pady=8
+        )
+        self.complaint_text.pack(fill="x", pady=(7, 11))
+        self.complaint_text.insert(
+            "1.0", "There is a large pothole on the road near our college."
+        )
+
+        tk.Button(
+            self.submit_tab, text="Analyse and Submit Complaint",
+            command=self.analyse_and_submit, bg="#1769aa", fg="white",
+            activebackground="#125487", font=("Arial", 11, "bold"),
+            padx=14, pady=9, relief="flat", cursor="hand2"
+        ).pack(anchor="w")
+
+        self.result_frame = tk.LabelFrame(
+            self.submit_tab, text=" NLP Analysis Result ",
+            font=("Arial", 10, "bold"), bg="white", fg="#15344d",
+            padx=12, pady=9
+        )
+        self.result_frame.pack(fill="x", pady=12)
+
+        self.result_labels = {}
+        for key in ["Category", "Department", "Priority", "Confidence"]:
+            row = tk.Frame(self.result_frame, bg="white")
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{key}:", width=14, anchor="w",
+                     font=("Arial", 10, "bold"), bg="white").pack(side="left")
+            value = tk.Label(row, text="Not analysed yet", anchor="w",
+                             font=("Arial", 10), bg="white", fg="#1769aa")
+            value.pack(side="left")
+            self.result_labels[key] = value
+
+        tk.Label(
+            self.submit_tab,
+            text=f"TF-IDF + Logistic Regression | Training examples: {self.dataset_size} | "
+                 f"Test accuracy: {self.accuracy:.0%}",
+            font=("Arial", 9), bg="white", fg="#64748b"
+        ).pack(anchor="w", side="bottom", pady=(5, 0))
+
+    def build_history_tab(self):
+        tk.Label(
+            self.history_tab, text="My Complaints",
+            font=("Arial", 18, "bold"), bg="white", fg="#15344d"
+        ).pack(anchor="w")
+        tk.Label(
+            self.history_tab,
+            text="Only complaints submitted from your account are shown here.",
+            font=("Arial", 10), bg="white", fg="#64748b"
+        ).pack(anchor="w", pady=(4, 10))
+
+        columns = ("id", "date", "category", "priority", "status")
+        self.tree = ttk.Treeview(
+            self.history_tab, columns=columns, show="headings", height=9
+        )
+        headings = {
+            "id": ("Complaint ID", 95),
+            "date": ("Date", 145),
+            "category": ("Category", 190),
+            "priority": ("Priority", 95),
+            "status": ("Status", 120),
+        }
+        for col, (heading, width) in headings.items():
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=width, anchor="center")
+        self.tree.pack(fill="both", expand=True, pady=8)
+        self.tree.bind("<<TreeviewSelect>>", self.show_history_details)
+
+        self.detail_label = tk.Label(
+            self.history_tab,
+            text="Select a complaint to see its department and any message "
+                 "from the administrator.",
+            font=("Arial", 10), bg="#f8fafc", fg="#334155", anchor="w",
+            justify="left", wraplength=780, padx=10, pady=8,
+            relief="solid", bd=1
+        )
+        self.detail_label.pack(fill="x", pady=(0, 6))
+
+        tk.Button(
+            self.history_tab, text="Refresh My Complaints",
+            command=self.refresh_history, relief="groove", padx=12, pady=6
+        ).pack(anchor="e", pady=5)
+
+    def show_history_details(self, _event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        row = next((r for r in read_rows(COMPLAINTS_FILE)
+                    if r.get("Complaint ID") == selection[0]
+                    and r.get("Username") == self.current_user), None)
+        if row is None:
+            return
+        remark = (row.get("Admin Remark") or "").strip()
+        updated = (row.get("Updated At") or "").strip()
+        text = (f"Complaint: {row.get('Complaint', '')}\n"
+                f"Department: {row.get('Department', '')}")
+        if remark:
+            text += f"\nAdministrator message: {remark}"
+        if updated:
+            text += f"\nLast updated: {updated}"
+        self.detail_label.config(text=text)
+
+    def reset_results(self):
+        for label in self.result_labels.values():
+            label.config(text="Not analysed yet")
+
+    def reject_complaint(self, title, message):
+        self.reset_results()
+        messagebox.showwarning(title, message)
+
+    def analyse_and_submit(self):
+        complaint = self.complaint_text.get("1.0", "end").strip()
+
+        # Validation: nothing is classified or saved unless it passes.
+        ok, reason = self.validator.validate(complaint)
+        if not ok:
+            self.reject_complaint("Invalid complaint", reason)
+            return
+
+        # Block accidental double submission of the same complaint.
+        normalised = clean_text(complaint)
+        for row in read_rows(COMPLAINTS_FILE):
+            if (row.get("Username") == self.current_user
+                    and clean_text(row.get("Complaint", "")) == normalised):
+                self.reject_complaint(
+                    "Duplicate complaint",
+                    "You have already submitted this complaint "
+                    f"(Complaint ID {row['Complaint ID']})."
+                )
+                return
+
+        cleaned = normalised
+        category = self.model.predict([cleaned])[0]
+        probabilities = self.model.predict_proba([cleaned])[0]
+        confidence = max(probabilities)
+
+        if confidence < MIN_CATEGORY_CONFIDENCE:
+            self.reject_complaint(
+                "Complaint unclear",
+                "We could not work out which department this belongs to. "
+                "Please add details: what is wrong, and where "
+                "(e.g. 'Garbage has not been collected on MG Road for 5 days')."
+            )
+            return
+
+        department = DEPARTMENTS.get(category, "General Administration")
+        priority = detect_priority(complaint, category)
+
+        values = {
+            "Category": category,
+            "Department": department,
+            "Priority": priority,
+            "Confidence": f"{confidence:.1%} (model estimate)"
+        }
+        for key, value in values.items():
+            self.result_labels[key].config(text=value)
+
+        rows = read_rows(COMPLAINTS_FILE)
+        complaint_id = max(
+            [int(r["Complaint ID"]) for r in rows if r["Complaint ID"].isdigit()],
+            default=1000
+        ) + 1
+
+        with open(COMPLAINTS_FILE, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=COMPLAINT_FIELDS)
+            writer.writerow({
+                "Complaint ID": complaint_id,
+                "Username": self.current_user,
+                "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "Complaint": complaint,
+                "Category": category,
+                "Department": department,
+                "Priority": priority,
+                "Status": "Pending",
+                "Admin Remark": "",
+                "Updated At": ""
+            })
+
+        self.refresh_history()
+        messagebox.showinfo(
+            "Complaint submitted",
+            f"Your complaint has been submitted.\nComplaint ID: {complaint_id}"
+        )
+        self.complaint_text.delete("1.0", "end")
+
+    def refresh_history(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        rows = read_rows(COMPLAINTS_FILE)
+        my_rows = [r for r in rows if r.get("Username") == self.current_user]
+        for row in reversed(my_rows):
+            self.tree.insert("", "end", iid=row["Complaint ID"], values=(
+                row["Complaint ID"], row["Date"], row["Category"],
+                row["Priority"], row["Status"]
+            ))
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CivicCareApp(root)
+    root.mainloop()
