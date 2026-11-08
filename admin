@@ -1,0 +1,89 @@
+"""
+Run:  python test_admin.py
+Tests the logic behind the administrator features (no windows opened):
+password hashing, upgrading an old complaints file, and adding corrected
+complaints to the training data safely.
+"""
+import csv
+import os
+import shutil
+import sys
+import tempfile
+
+import pandas as pd
+
+import core
+
+PASSED = FAILED = 0
+
+
+def check(name, condition):
+    global PASSED, FAILED
+    PASSED += condition
+    FAILED += not condition
+    print(("PASS  " if condition else "FAIL  ") + name)
+
+
+def main():
+    real_dataset = core.DATASET_FILE
+    tmp = tempfile.mkdtemp()
+    try:
+        # 1. passwords
+        salt, digest = core.hash_password("Secret@123")
+        check("password hash is not the plain password", digest != "Secret@123")
+        check("correct password verifies",
+              core.verify_password("Secret@123", salt, digest))
+        check("wrong password is rejected",
+              not core.verify_password("secret@123", salt, digest))
+
+        # 2. old complaints file is upgraded without losing rows
+        core.COMPLAINTS_FILE = os.path.join(tmp, "complaints.csv")
+        old = ["Complaint ID", "Username", "Date", "Complaint", "Category",
+               "Department", "Priority", "Status"]
+        with open(core.COMPLAINTS_FILE, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(old)
+            w.writerow(["1001", "u", "2026-01-01 10:00", "Pothole.", "Roads & Potholes",
+                        "Road Maintenance Department", "High", "Pending"])
+        core.migrate_complaints_file()
+        rows = core.read_rows(core.COMPLAINTS_FILE)
+        check("old file gets the new admin columns",
+              list(rows[0].keys()) == core.COMPLAINT_FIELDS)
+        check("old complaint rows are kept", rows[0]["Complaint ID"] == "1001")
+
+        # 3. training data: file WITHOUT a trailing newline (as Excel saves it)
+        core.DATASET_FILE = os.path.join(tmp, "dataset.csv")
+        with open(core.DATASET_FILE, "w", newline="", encoding="utf-8") as f:
+            f.write("complaint,category\nThe road is broken.,Roads & Potholes")
+        added = core.add_training_example("Robbery at the bank.", "Crime & Public Safety")
+        data = pd.read_csv(core.DATASET_FILE)
+        check("correction is added to the dataset", added and len(data) == 2)
+        check("new row did not merge into the previous line",
+              data.iloc[-1]["complaint"] == "Robbery at the bank.")
+        check("exact duplicate is not added twice",
+              not core.add_training_example("Robbery at the bank.", "Crime & Public Safety"))
+        check("duplicate with different case/punctuation is not added",
+              not core.add_training_example("ROBBERY at the bank!!", "Crime & Public Safety"))
+
+        # 4. invalid examples
+        core.INVALID_FILE = os.path.join(tmp, "invalid.csv")
+        check("invalid example creates the file with a header",
+              core.add_invalid_example("I am a stray dog.")
+              and list(pd.read_csv(core.INVALID_FILE).columns) == ["text"])
+        check("duplicate invalid example is not added twice",
+              not core.add_invalid_example("i am a stray dog"))
+
+        # 5. the shipped dataset only uses categories the app can route
+        shipped = pd.read_csv(real_dataset)
+        unknown = set(shipped["category"]) - set(core.DEPARTMENTS)
+        check("every category in the dataset has a department", not unknown)
+    finally:
+        core.DATASET_FILE = real_dataset
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print(f"\n{PASSED} passed, {FAILED} failed")
+    return 1 if FAILED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
